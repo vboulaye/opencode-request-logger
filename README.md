@@ -4,9 +4,9 @@ An [OpenCode](https://opencode.ai) plugin that logs raw LLM request bodies to di
 
 ## What it does
 
-Intercepts outgoing fetch calls to LLM providers (Anthropic, OpenAI, Google, Bedrock, etc.) and writes each request body as a timestamped JSON file. Logs are organized by session ID.
+Logs outgoing JSON provider HTTP requests and WebSocket frames through OpenCode V2's native session hooks. Each request is written as a timestamped JSON file, organized by session ID.
 
-**Log location:** `~/.config/opencode/logs/request-logger/<sessionId>/<timestamp>_<seq>.json`
+**Log location:** `$XDG_CONFIG_HOME/opencode/logs/request-logger/<sessionId>/<timestamp>_<seq>.json`, falling back to `~/.config/opencode/logs/request-logger/` when `XDG_CONFIG_HOME` is unset.
 
 Each file contains:
 
@@ -20,18 +20,22 @@ Each file contains:
 
 ## How it works
 
-Two interception layers ensure coverage across all providers:
+The plugin uses `Plugin.define` from `@opencode/plugin` (SDK 2.2.3):
 
-1. **`globalThis.fetch` wrapper** -- catches most providers since the AI SDK routes through fetch
-2. **`chat.params` hook** -- wraps the per-request fetch passed to `streamText`, catching providers that bypass `globalThis.fetch` (e.g. AWS Bedrock)
+1. **`http.request` hook** — reads a clone of each native provider request, preserving its body for dispatch.
+2. **`experimental.ws.send` hook** — logs outgoing JSON frames for WebSocket-backed providers. These entries use `"url": "websocket"` because the frame event does not expose the connection URL. This hook is experimental in OpenCode.
 
-Only requests with an AI-shaped body (containing `messages`, `input`, or `contents` arrays) are logged.
+The native hooks cover primary, compaction, title, and transient generation requests. There is no process-wide fetch patch or shared current-session variable. Each HTTP attempt/frame is recorded separately, including retries. Empty and non-JSON bodies are skipped; logging failures do not interrupt requests. Requests outside these hooks are not captured.
+
+**Security:** Raw bodies can contain prompts, source code, tool results, personal data, and secrets. Logs are not redacted or automatically deleted. Keep them private and remove them when no longer needed. HTTP headers are not recorded. New session directories use mode `0700`; new log files use `0600` (existing directory permissions are unchanged).
 
 ## Installation
 
+Requires OpenCode V2 and Bun 1.4.4 or newer. OpenCode V1 is no longer supported.
+
 ```bash
 # From the plugin directory
-bun install
+bun install --frozen-lockfile
 bun run build
 ```
 
@@ -39,6 +43,18 @@ Then add to your OpenCode config (`~/.config/opencode/opencode.jsonc`):
 
 ```json
 {
-  "plugin": [ "./plugin/opencode-request-logger" ]
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [ "/absolute/path/to/opencode-request-logger" ]
 }
 ```
+
+Use the plugin directory, not `index.ts` or `dist/index.js`. If migrating an existing configuration, rename `plugin` to `plugins`. Run `/reload` in OpenCode after rebuilding to reload the plugin.
+
+## Development
+
+```bash
+bun install --frozen-lockfile
+bun run test
+```
+
+Tests build and import the compiled entrypoint, then exercise the hooks with local fixtures; they do not call an LLM provider. To undo the migration, restore the previous plugin revision and matching lockfile, reinstall and rebuild. The previous revision only supports OpenCode V1.

@@ -1,4 +1,4 @@
-import type { Plugin } from "@opencode-ai/plugin";
+import { Plugin } from "@opencode/plugin";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -11,35 +11,11 @@ const LOG_ROOT = join(
 );
 
 let sequence = 0;
-let currentSessionId = "unknown";
-
-/** Set of request bodies already logged by the global wrapper (avoid double-logging). */
-const logged = new WeakSet<object>();
-
-function getHeader(headers: any, name: string): string | null {
-  if (!headers) return null;
-  if (typeof headers.get === "function") return headers.get(name);
-  if (typeof headers === "object") return headers[name] ?? null;
-  return null;
-}
-
-function isAiRequestBody(body: any): boolean {
-  return (
-    (body.messages && Array.isArray(body.messages)) || // Anthropic, OpenAI Chat, Bedrock Converse
-    (body.input && Array.isArray(body.input)) || // OpenAI Responses API
-    (body.contents && Array.isArray(body.contents)) // Google Gemini / Vertex
-  );
-}
-
-function resolveUrl(input: any): string {
-  if (typeof input === "string") return input;
-  if (input instanceof URL) return input.href;
-  return input?.url ?? "unknown";
-}
-
-function writeLog(sessionId: string, url: string, body: string): void {
-  const dir = join(LOG_ROOT, sessionId);
-  mkdirSync(dir, { recursive: true });
+function writeLog(sessionId: string, url: string, body: unknown): void {
+  // Session IDs must never be able to escape the log directory.
+  const safeSessionId = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_") || "unknown";
+  const dir = join(LOG_ROOT, safeSessionId);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
 
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   const seq = String(sequence++).padStart(4, "0");
@@ -48,62 +24,34 @@ function writeLog(sessionId: string, url: string, body: string): void {
   const envelope = {
     timestamp: new Date().toISOString(),
     url,
-    body: JSON.parse(body),
+    body,
   };
 
-  writeFileSync(file, JSON.stringify(envelope, null, 2));
+  writeFileSync(file, JSON.stringify(envelope, null, 2), { mode: 0o600 });
 }
 
-function tryLog(init: any, input: any, source: string): void {
-  if (!init?.body || typeof init.body !== "string") return;
-  try {
-    const body = JSON.parse(init.body);
-    if (!isAiRequestBody(body)) return;
-    if (logged.has(body)) return;
-    logged.add(body);
-
-    const sessionId =
-      getHeader(init.headers, "x-opencode-session") || currentSessionId;
-    const url = resolveUrl(input);
-
-    writeLog(sessionId, url, init.body);
-  } catch (_e) {
-    // Never let logging break the actual request
-  }
-}
-
-const plugin: Plugin = async (_ctx) => {
-  // --- Layer 1: globalThis.fetch wrapper ---
-  // Catches most providers since AI SDK calls ultimately go through fetch.
-  const originalFetch = globalThis.fetch;
-
-  globalThis.fetch = async (input: any, init?: any) => {
-    tryLog(init, input, "global");
-    return originalFetch(input, init);
-  };
-
-  return {
-    // --- Layer 2: chat.params fetch wrapper ---
-    // Catches providers whose SDK may bypass globalThis.fetch
-    // (e.g. AWS Bedrock using its own HTTP client).
-    // Wraps the per-request fetch that opencode passes to streamText.
-    "chat.params": async (input, output) => {
-      if (input.sessionID) {
-        currentSessionId = input.sessionID;
+const plugin = Plugin.define({
+  id: "opencode-request-logger",
+  async setup(ctx) {
+    await ctx.session.hook("http.request", async (event) => {
+      try {
+        if (!event.request.body) return;
+        // Native bodies are one-shot streams; reading a clone preserves dispatch.
+        const body: unknown = await event.request.clone().json();
+        writeLog(event.sessionID, event.request.url, body);
+      } catch {
+        // Malformed/non-JSON bodies and filesystem failures must not break dispatch.
       }
-
-      const existingFetch = (output as any).options?.fetch ?? globalThis.fetch;
-
-      (output as any).options = (output as any).options ?? {};
-      (output as any).options.fetch = async (
-        fetchInput: any,
-        fetchInit?: any,
-      ) => {
-        tryLog(fetchInit, fetchInput, "chat.params");
-        return existingFetch(fetchInput, fetchInit);
-      };
-    },
-  };
-};
+    });
+    await ctx.session.hook("experimental.ws.send", async (event) => {
+      try {
+        // The frame hook does not expose a URL; do not guess the provider endpoint.
+        writeLog(event.sessionID, "websocket", JSON.parse(event.frame));
+      } catch {
+        // Logging must not alter or interrupt the outgoing frame.
+      }
+    });
+  },
+});
 
 export default plugin;
